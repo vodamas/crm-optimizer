@@ -1,4 +1,5 @@
 import type { Mitigant } from '../model/types';
+import { OsfiTooltip } from './OsfiTooltip';
 
 interface Props {
   mitigants: Mitigant[];
@@ -18,6 +19,13 @@ const TYPE_LABELS: Record<string, string> = {
   real_estate: 'Real Estate (LTV)',
 };
 
+const TYPE_REFS: Record<string, string> = {
+  financial_collateral: 'comprehensive_method',
+  guarantee: 'guarantees',
+  netting: 'netting',
+  real_estate: 'real_estate_ltv',
+};
+
 function fmt(n: number): string {
   return n.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 }
@@ -25,7 +33,10 @@ function fmt(n: number): string {
 export function MitigantPanel({ mitigants }: Props) {
   return (
     <div className="card">
-      <h3 className="card-title">Available Mitigants</h3>
+      <h3 className="card-title">
+        Available Mitigants
+        <OsfiTooltip refKey="crm_framework" />
+      </h3>
       <div className="mitigant-grid">
         {mitigants.map(m => (
           <div key={m.id} className={`mitigant-card mit-${m.type}`}>
@@ -33,14 +44,20 @@ export function MitigantPanel({ mitigants }: Props) {
               <span className="mit-icon">{TYPE_ICONS[m.type] ?? '?'}</span>
               <div>
                 <div className="mit-name">{m.name}</div>
-                <div className="mit-type">{TYPE_LABELS[m.type] ?? m.type}</div>
+                <div className="mit-type">
+                  {TYPE_LABELS[m.type] ?? m.type}
+                  <OsfiTooltip refKey={TYPE_REFS[m.type] ?? 'crm_framework'} />
+                </div>
               </div>
             </div>
             <div className="mit-details">
               {m.type === 'financial_collateral' && (
                 <>
                   <div className="mit-row"><span>Value:</span><span>${fmt(m.value)}M</span></div>
-                  <div className="mit-row"><span>Hc:</span><span>{((m.Hc ?? 0) * 100).toFixed(0)}%</span></div>
+                  <div className="mit-row">
+                    <span>Hc: <OsfiTooltip refKey="standard_haircuts" /></span>
+                    <span>{((m.Hc ?? 0) * 100).toFixed(0)}%</span>
+                  </div>
                   {(m.Hfx ?? 0) > 0 && <div className="mit-row"><span>Hfx:</span><span>{((m.Hfx ?? 0) * 100).toFixed(0)}%</span></div>}
                 </>
               )}
@@ -53,7 +70,10 @@ export function MitigantPanel({ mitigants }: Props) {
               {m.type === 'netting' && (
                 <>
                   <div className="mit-row"><span>Liability:</span><span>${fmt(m.liabilityAmount ?? 0)}M</span></div>
-                  <div className="mit-row"><span>Netting Set:</span><span>{m.nettingSetId}</span></div>
+                  <div className="mit-row">
+                    <span>NGR: <OsfiTooltip refKey="ngr_formula" /></span>
+                    <span>{m.nettingSetId}</span>
+                  </div>
                 </>
               )}
               {m.type === 'real_estate' && (

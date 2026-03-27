@@ -1,7 +1,8 @@
 """Waterfall (heuristic) CRM allocation: assign best mitigant to highest-risk exposure first."""
 
 from __future__ import annotations
-from models import Exposure, Mitigant, AllocationEntry, ExposureResult, OptimizeResponse
+from typing import Tuple, List
+from models import Exposure, Mitigant, AllocationEntry, ExposureResult, OptimizeResponse, HeuristicStep
 from crm_formulas import (
     financial_collateral_rwa, guarantee_rwa, netting_rwa, real_estate_rwa,
 )
@@ -23,30 +24,44 @@ def _mitigant_effectiveness(m: Mitigant, max_rw: float) -> float:
     return 0.0
 
 
-def solve_heuristic(exposures: list[Exposure], mitigants: list[Mitigant]) -> OptimizeResponse:
-    # Sort exposures by RW desc, EAD desc
+def solve_heuristic(
+    exposures: list[Exposure], mitigants: list[Mitigant],
+) -> Tuple[OptimizeResponse, List[HeuristicStep]]:
+    """Returns (response, trace) where trace is the step-by-step decision log."""
     sorted_exp = sorted(exposures, key=lambda e: (-e.risk_weight, -e.ead))
     max_rw = max((e.risk_weight for e in exposures), default=1.0)
-
-    # Sort mitigants by effectiveness desc
     sorted_mit = sorted(mitigants, key=lambda m: -_mitigant_effectiveness(m, max_rw))
+
+    mit_map = {m.id: m for m in mitigants}
+    exp_map = {e.id: e for e in exposures}
 
     remaining_cap: dict[str, float] = {m.id: 1.0 for m in mitigants}
     allocations: list[AllocationEntry] = []
+    trace: list[HeuristicStep] = []
+    step_num = 0
 
-    # Pre-apply netting (it's not allocatable, it either applies or not)
-    netting_applied: set[str] = set()
+    # Pre-apply netting
     for m in mitigants:
         if m.type == "netting" and m.netting_set_id:
-            netting_applied.add(m.netting_set_id)
             for e in exposures:
                 if e.id in m.eligible_exposure_ids:
                     allocations.append(AllocationEntry(
                         exposure_id=e.id, mitigant_id=m.id, fraction=1.0,
                     ))
+                    gross = e.ead * e.risk_weight
+                    net = netting_rwa(e.ead, e.risk_weight, m.liability_amount or 0, m.add_on_factor or 0)
+                    step_num += 1
+                    trace.append(HeuristicStep(
+                        step_number=step_num,
+                        exposure_id=e.id,
+                        mitigant_id=m.id,
+                        reason=f"Pre-apply netting set {m.netting_set_id}: {m.name} covers {e.name} (all eligible exposures in set)",
+                        rwa_saving=round(gross - net, 2),
+                        fraction=1.0,
+                    ))
             remaining_cap[m.id] = 0.0
 
-    # Greedy allocation for non-netting mitigants
+    # Greedy allocation
     for exp in sorted_exp:
         if exp.risk_weight <= 0:
             continue
@@ -58,7 +73,6 @@ def solve_heuristic(exposures: list[Exposure], mitigants: list[Mitigant]) -> Opt
             if exp.id not in mit.eligible_exposure_ids:
                 continue
 
-            # How much fraction to use
             if mit.type == "financial_collateral":
                 needed = exp.ead / mit.value if mit.value > 0 else 1.0
             elif mit.type == "guarantee":
@@ -72,12 +86,35 @@ def solve_heuristic(exposures: list[Exposure], mitigants: list[Mitigant]) -> Opt
             if frac < 0.001:
                 continue
 
+            # Compute RWA saving for this allocation
+            gross = exp.ead * exp.risk_weight
+            if mit.type == "financial_collateral":
+                new_rwa = financial_collateral_rwa(exp.ead, exp.risk_weight, mit.value, frac, mit.Hc, mit.He, mit.Hfx)
+            elif mit.type == "guarantee":
+                new_rwa = guarantee_rwa(exp.ead, exp.risk_weight, mit.guarantor_risk_weight or 0, mit.value, frac)
+            elif mit.type == "real_estate":
+                new_rwa = real_estate_rwa(exp.ead, exp.risk_weight, mit.property_value or 0, mit.ltv or 1.0, frac)
+            else:
+                new_rwa = gross
+            saving = gross - new_rwa
+
+            effectiveness = round(_mitigant_effectiveness(mit, max_rw), 1)
+            step_num += 1
+            trace.append(HeuristicStep(
+                step_number=step_num,
+                exposure_id=exp.id,
+                mitigant_id=mit.id,
+                reason=f"RW={exp.risk_weight*100:.0f}% is highest remaining; {mit.name} ({mit.type.replace('_',' ')}) has effectiveness score {effectiveness}",
+                rwa_saving=round(saving, 2),
+                fraction=round(frac, 4),
+            ))
+
             allocations.append(AllocationEntry(
-                exposure_id=exp.id, mitigant_id=mit.id, fraction=frac,
+                exposure_id=exp.id, mitigant_id=mit.id, fraction=round(frac, 4),
             ))
             remaining_cap[mit.id] -= frac
 
-    return _build_response(exposures, mitigants, allocations)
+    return _build_response(exposures, mitigants, allocations), trace
 
 
 def _build_response(
@@ -86,9 +123,7 @@ def _build_response(
     allocations: list[AllocationEntry],
 ) -> OptimizeResponse:
     mit_map = {m.id: m for m in mitigants}
-    exp_map = {e.id: e for e in exposures}
 
-    # Group allocations by exposure
     alloc_by_exp: dict[str, list[AllocationEntry]] = {}
     for a in allocations:
         alloc_by_exp.setdefault(a.exposure_id, []).append(a)
@@ -110,7 +145,6 @@ def _build_response(
             total_net += gross_rwa
             continue
 
-        # Compute net RWA considering all assigned mitigants
         net_rwa = gross_rwa
         mids: list[str] = []
         for a in exp_allocs:

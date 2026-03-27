@@ -1,4 +1,7 @@
-import type { Exposure, Mitigant, AllocationResult } from '../model/types';
+import type {
+  Exposure, Mitigant, AllocationResult, HeuristicStep,
+  DualValues, AllocationMatrix, SensitivityPoint,
+} from '../model/types';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 
@@ -51,6 +54,27 @@ interface ApiResponse {
   by_mitigant_type: Record<string, number>;
 }
 
+interface ApiHeuristicStep {
+  step_number: number;
+  exposure_id: string;
+  mitigant_id: string;
+  reason: string;
+  rwa_saving: number;
+  fraction: number;
+}
+
+interface ApiDualValues {
+  mitigant_marginals: Record<string, number>;
+}
+
+interface ApiFullResponse {
+  heuristic: ApiResponse;
+  optimized: ApiResponse;
+  heuristic_trace: ApiHeuristicStep[] | null;
+  dual_values: ApiDualValues | null;
+  allocation_matrix: Record<string, Record<string, Record<string, number>>> | null;
+}
+
 function fromApiResponse(r: ApiResponse): AllocationResult {
   return {
     allocations: r.allocations.map(a => ({ exposureId: a.exposure_id, mitigantId: a.mitigant_id, fraction: a.fraction })),
@@ -63,9 +87,32 @@ function fromApiResponse(r: ApiResponse): AllocationResult {
   };
 }
 
+function fromApiTrace(steps: ApiHeuristicStep[]): HeuristicStep[] {
+  return steps.map(s => ({
+    stepNumber: s.step_number,
+    exposureId: s.exposure_id,
+    mitigantId: s.mitigant_id,
+    reason: s.reason,
+    rwaSaving: s.rwa_saving,
+    fraction: s.fraction,
+  }));
+}
+
+function fromApiDualValues(d: ApiDualValues): DualValues {
+  return { mitigantMarginals: d.mitigant_marginals };
+}
+
+export interface OptimizeResult {
+  heuristic: AllocationResult;
+  optimized: AllocationResult;
+  heuristicTrace: HeuristicStep[];
+  dualValues: DualValues | null;
+  allocationMatrix: Record<string, AllocationMatrix>;
+}
+
 export async function fetchOptimization(
   exposures: Exposure[], mitigants: Mitigant[],
-): Promise<{ heuristic: AllocationResult; optimized: AllocationResult }> {
+): Promise<OptimizeResult> {
   const res = await fetch(`${API_URL}/api/optimize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -75,9 +122,29 @@ export async function fetchOptimization(
     }),
   });
   if (!res.ok) throw new Error(`API error: ${res.status}`);
-  const data = await res.json();
+  const data: ApiFullResponse = await res.json();
   return {
     heuristic: fromApiResponse(data.heuristic),
     optimized: fromApiResponse(data.optimized),
+    heuristicTrace: data.heuristic_trace ? fromApiTrace(data.heuristic_trace) : [],
+    dualValues: data.dual_values ? fromApiDualValues(data.dual_values) : null,
+    allocationMatrix: data.allocation_matrix ?? {},
   };
+}
+
+export async function fetchSensitivity(
+  exposures: Exposure[], mitigants: Mitigant[], stressFactors: number[],
+): Promise<SensitivityPoint[]> {
+  const res = await fetch(`${API_URL}/api/sensitivity`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      exposures: exposures.map(toApiExposure),
+      mitigants: mitigants.map(toApiMitigant),
+      stress_factors: stressFactors,
+    }),
+  });
+  if (!res.ok) throw new Error(`Sensitivity API error: ${res.status}`);
+  const data: Array<{ stress_factor: number; total_net_rwa: number }> = await res.json();
+  return data.map(p => ({ stressFactor: p.stress_factor, totalNetRwa: p.total_net_rwa }));
 }

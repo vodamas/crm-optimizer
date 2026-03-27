@@ -63,3 +63,35 @@ class OptimizeResponse(BaseModel):
     rwa_savings: float
     rwa_savings_pct: float
     by_mitigant_type: Dict[str, float]
+
+
+class HeuristicStep(BaseModel):
+    step_number: int
+    exposure_id: str
+    mitigant_id: str
+    reason: str
+    rwa_saving: float
+    fraction: float
+
+
+class DualValues(BaseModel):
+    mitigant_marginals: Dict[str, float]
+
+
+class SensitivityPoint(BaseModel):
+    stress_factor: float
+    total_net_rwa: float
+
+
+class SensitivityRequest(BaseModel):
+    exposures: List[Exposure]
+    mitigants: List[Mitigant]
+    stress_factors: List[float]
+
+
+class EnrichedOptimizeResponse(BaseModel):
+    heuristic: OptimizeResponse
+    optimized: OptimizeResponse
+    heuristic_trace: List[HeuristicStep]
+    dual_values: Optional[DualValues] = None
+    allocation_matrix: Dict[str, Dict[str, Dict[str, float]]]  # mode -> exp_id -> mit_id -> frac

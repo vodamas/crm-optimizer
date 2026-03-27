@@ -1,29 +1,32 @@
 """LP-based optimal CRM allocation using scipy.optimize.linprog."""
 
 from __future__ import annotations
+from typing import Tuple, Optional, List
+import copy
 import numpy as np
 from scipy.optimize import linprog
-from models import Exposure, Mitigant, AllocationEntry, ExposureResult, OptimizeResponse
+from models import (
+    Exposure, Mitigant, AllocationEntry, ExposureResult, OptimizeResponse,
+    DualValues, SensitivityPoint,
+)
 from crm_formulas import (
     financial_collateral_rwa, guarantee_rwa, netting_rwa, real_estate_rwa, ltv_to_rw,
 )
 
 
-def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> OptimizeResponse:
+def solve_optimal(
+    exposures: list[Exposure], mitigants: list[Mitigant],
+) -> Tuple[OptimizeResponse, Optional[DualValues]]:
     """Minimize total portfolio RWA via linear programming.
 
-    The LP is structured as:
-      - For guarantee/RE mitigants: the RWA reduction is linear in x[i,j], so the objective
-        coefficient for x[i,j] is negative (saving).
-      - For financial collateral: we introduce auxiliary E_star_i variables.
-      - For netting: pre-applied (not allocatable).
+    Returns (response, dual_values) where dual_values contains marginal
+    RWA savings per unit of mitigant capacity.
     """
     n_exp = len(exposures)
     n_mit = len(mitigants)
     exp_idx = {e.id: i for i, e in enumerate(exposures)}
     mit_idx = {m.id: j for j, m in enumerate(mitigants)}
 
-    # Identify eligible (i, j) pairs
     eligible_pairs: list[tuple[int, int]] = []
     pair_to_var: dict[tuple[int, int], int] = {}
     non_netting_mitigants = [m for m in mitigants if m.type != "netting"]
@@ -37,9 +40,8 @@ def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> Optim
                 pair_to_var[(i, j)] = var_idx
                 eligible_pairs.append((i, j))
 
-    n_x = len(eligible_pairs)  # x[i,j] variables
+    n_x = len(eligible_pairs)
 
-    # Identify exposures that receive financial collateral (need E_star aux vars)
     collateral_exposures: set[int] = set()
     for m in non_netting_mitigants:
         if m.type == "financial_collateral":
@@ -52,7 +54,6 @@ def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> Optim
     for ci, ei in enumerate(sorted(collateral_exposures)):
         estar_map[ei] = n_x + ci
     n_estar = len(estar_map)
-
     n_vars = n_x + n_estar
 
     # Pre-apply netting
@@ -63,7 +64,6 @@ def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> Optim
             for eid in m.eligible_exposure_ids:
                 if eid in exp_idx:
                     e = exposures[exp_idx[eid]]
-                    gross = e.ead * e.risk_weight
                     net = netting_rwa(e.ead, e.risk_weight, m.liability_amount or 0, m.add_on_factor or 0)
                     netting_results[eid] = net
                     netting_allocations.append(AllocationEntry(
@@ -71,13 +71,10 @@ def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> Optim
                     ))
 
     if n_vars == 0:
-        # No allocatable mitigants, just return gross (with netting if any)
-        return _build_response_from_allocs(exposures, mitigants, netting_allocations, netting_results)
+        return _build_response_from_allocs(exposures, mitigants, netting_allocations, netting_results), None
 
-    # Build objective: minimize total RWA
+    # Build objective
     c = np.zeros(n_vars)
-
-    # Constant term (gross RWA for all exposures, adjusted for netting)
     constant = 0.0
     for e in exposures:
         if e.id in netting_results:
@@ -85,57 +82,49 @@ def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> Optim
         else:
             constant += e.ead * e.risk_weight
 
-    # For guarantee and real_estate mitigants: RWA saving is linear
-    # RWA_i = grossRWA_i - sum_j saving_per_unit[i,j] * x[i,j]
-    # So objective coefficient for x[i,j] = -saving_per_unit
     for (i, j), vi in pair_to_var.items():
         m = mitigants[j]
         e = exposures[i]
         if e.id in netting_results:
-            continue  # netting already applied, skip
+            continue
 
         if m.type == "guarantee":
             grw = m.guarantor_risk_weight or 0.0
-            # Covered = min(G*x, E) -> for LP assume G*x <= E (add constraint)
-            # Saving per unit x = G * (RW_borrower - RW_guarantor)
             saving = m.value * (e.risk_weight - grw)
-            c[vi] = -saving  # minimize, so negative saving
-
+            c[vi] = -saving
         elif m.type == "real_estate":
             rw_sec = ltv_to_rw(m.ltv or 1.0)
             pv = m.property_value or 0.0
-            # Saving per unit x = pv * (RW_unsecured - RW_secured)
             saving = pv * (e.risk_weight - rw_sec)
             c[vi] = -saving
-
         elif m.type == "financial_collateral":
-            # For collateral, the x variables don't directly appear in objective
-            # Instead, E_star variables carry the cost
             c[vi] = 0.0
 
-    # E_star variables carry cost = RW_i
     for ei, vi in estar_map.items():
         e = exposures[ei]
         if e.id not in netting_results:
             c[vi] = e.risk_weight
-            # Remove gross RWA for these exposures from constant (E_star replaces it)
             constant -= e.ead * e.risk_weight
 
-    # Inequality constraints (A_ub @ x <= b_ub)
+    # Inequality constraints
     A_rows = []
     b_rows = []
 
-    # 1. Mitigant capacity: sum_i x[i,j] <= 1 for each non-netting mitigant
+    # Track which constraint rows correspond to mitigant capacity
+    capacity_constraint_indices: list[tuple[str, int]] = []  # (mitigant_id, row_index)
+
+    # 1. Mitigant capacity: sum_i x[i,j] <= 1
     for m in non_netting_mitigants:
         j = mit_idx[m.id]
         row = np.zeros(n_vars)
         for (i2, j2), vi in pair_to_var.items():
             if j2 == j:
                 row[vi] = 1.0
+        capacity_constraint_indices.append((m.id, len(A_rows)))
         A_rows.append(row)
         b_rows.append(1.0)
 
-    # 2. Coverage cap for guarantees: G * x[i,j] <= E_i
+    # 2. Coverage cap for guarantees
     for (i, j), vi in pair_to_var.items():
         m = mitigants[j]
         e = exposures[i]
@@ -145,7 +134,7 @@ def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> Optim
             A_rows.append(row)
             b_rows.append(e.ead)
 
-    # 3. Coverage cap for real estate: pv * x[i,j] <= E_i
+    # 3. Coverage cap for real estate
     for (i, j), vi in pair_to_var.items():
         m = mitigants[j]
         e = exposures[i]
@@ -155,11 +144,7 @@ def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> Optim
             A_rows.append(row)
             b_rows.append(e.ead)
 
-    # 4. E_star constraints for financial collateral:
-    #    E_star_i >= E_i*(1+He) - sum_j C_j*(1-Hc-Hfx)*x[i,j]
-    #    Rearranged: -E_star_i + sum_j [-C_j*(1-Hc-Hfx)] * x[i,j] <= -E_i*(1+He)
-    #    But standard form A_ub @ x <= b_ub, so:
-    #    -sum_j [C_j*(1-Hc-Hfx)] * x[i,j] - E_star_i <= -E_i*(1+He_max)
+    # 4. E_star constraints for financial collateral
     for ei, estar_vi in estar_map.items():
         e = exposures[ei]
         if e.id in netting_results:
@@ -178,19 +163,30 @@ def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> Optim
         b_rows.append(-(e.ead * (1.0 + max_he)))
 
     if not A_rows:
-        return _build_response_from_allocs(exposures, mitigants, netting_allocations, netting_results)
+        return _build_response_from_allocs(exposures, mitigants, netting_allocations, netting_results), None
 
     A_ub = np.array(A_rows)
     b_ub = np.array(b_rows)
-
-    # Bounds: x[i,j] in [0,1], E_star_i >= 0
     bounds = [(0.0, 1.0)] * n_x + [(0.0, None)] * n_estar
 
     result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
 
     if not result.success:
-        # Fallback: return empty allocation
-        return _build_response_from_allocs(exposures, mitigants, netting_allocations, netting_results)
+        return _build_response_from_allocs(exposures, mitigants, netting_allocations, netting_results), None
+
+    # Extract dual values for mitigant capacity constraints
+    dual_values = None
+    if hasattr(result, 'ineqlin') and result.ineqlin is not None:
+        marginals = result.ineqlin.marginals
+        if marginals is not None and len(marginals) > 0:
+            mit_marginals = {}
+            for mit_id, row_idx in capacity_constraint_indices:
+                if row_idx < len(marginals):
+                    val = float(marginals[row_idx])
+                    if abs(val) > 0.001:
+                        mit_marginals[mit_id] = round(val, 4)
+            if mit_marginals:
+                dual_values = DualValues(mitigant_marginals=mit_marginals)
 
     # Extract allocations
     allocs = list(netting_allocations)
@@ -203,7 +199,30 @@ def solve_optimal(exposures: list[Exposure], mitigants: list[Mitigant]) -> Optim
                 fraction=round(frac, 4),
             ))
 
-    return _build_response_from_allocs(exposures, mitigants, allocs, netting_results)
+    return _build_response_from_allocs(exposures, mitigants, allocs, netting_results), dual_values
+
+
+def solve_sensitivity_sweep(
+    exposures: list[Exposure],
+    mitigants: list[Mitigant],
+    stress_factors: list[float],
+) -> List[SensitivityPoint]:
+    """Run LP with stressed haircuts for each factor and return the RWA curve."""
+    points: list[SensitivityPoint] = []
+    for factor in stress_factors:
+        stressed = []
+        for m in mitigants:
+            sm = m.model_copy()
+            sm.Hc = min(m.Hc * factor, 0.99)
+            sm.He = min(m.He * factor, 0.99)
+            sm.Hfx = min(m.Hfx * factor, 0.99)
+            stressed.append(sm)
+        resp, _ = solve_optimal(exposures, stressed)
+        points.append(SensitivityPoint(
+            stress_factor=round(factor, 2),
+            total_net_rwa=resp.total_net_rwa,
+        ))
+    return points
 
 
 def _build_response_from_allocs(

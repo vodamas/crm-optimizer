@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
-import type { AllocationEntry, AllocationResult, AllocationMode } from './model/types';
-import { EXPOSURES, MITIGANTS, TOTAL_GROSS_RWA } from './data/portfolio';
+import type { Exposure, Mitigant, AllocationEntry, AllocationResult, AllocationMode, HeuristicStep, DualValues, AllocationMatrix } from './model/types';
+import { EXPOSURES, MITIGANTS } from './data/portfolio';
 import { computeAllocationResult } from './model/crm';
 import { solveHeuristic } from './model/heuristic';
 import { fetchOptimization } from './api/optimize';
@@ -12,44 +12,78 @@ import { ManualAllocator } from './components/ManualAllocator';
 import { ComparisonTable } from './components/ComparisonTable';
 import { SummaryBarChart } from './components/SummaryBarChart';
 import { WaterfallChart } from './components/WaterfallChart';
+import { AllocationHeatmap } from './components/AllocationHeatmap';
+import { HeuristicTrace } from './components/HeuristicTrace';
+import { OptimizerInsightPanel } from './components/OptimizerInsightPanel';
+import { SensitivityPanel } from './components/SensitivityPanel';
+import { ConcentrationChart } from './components/ConcentrationChart';
+import { CollapsibleSection } from './components/CollapsibleSection';
+import { PortfolioEditorDrawer } from './components/PortfolioEditorDrawer';
 import './styles/app.css';
 
 export default function App() {
+  // Portfolio state (editable)
+  const [exposures, setExposures] = useState<Exposure[]>(EXPOSURES);
+  const [mitigants, setMitigants] = useState<Mitigant[]>(MITIGANTS);
+  const totalGrossRwa = exposures.reduce((s, e) => s + e.grossRwa, 0);
+
+  // Mode & UI state
   const [mode, setMode] = useState<AllocationMode>('heuristic');
+  const [editorOpen, setEditorOpen] = useState(false);
+
+  // Manual allocation state
   const [manualAllocs, setManualAllocs] = useState<AllocationEntry[]>([]);
   const [manualResult, setManualResult] = useState<AllocationResult | null>(null);
+
+  // Computed results
   const [heuristicResult, setHeuristicResult] = useState<AllocationResult | null>(null);
+  const [heuristicTrace, setHeuristicTrace] = useState<HeuristicStep[]>([]);
   const [optimizedResult, setOptimizedResult] = useState<AllocationResult | null>(null);
+  const [dualValues, setDualValues] = useState<DualValues | null>(null);
+  const [allocationMatrix, setAllocationMatrix] = useState<Record<string, AllocationMatrix>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Run heuristic on mount (client-side)
-  useEffect(() => {
-    setHeuristicResult(solveHeuristic(EXPOSURES, MITIGANTS));
-  }, []);
+  // Run heuristic client-side
+  const runHeuristic = useCallback(() => {
+    const { result, trace } = solveHeuristic(exposures, mitigants);
+    setHeuristicResult(result);
+    setHeuristicTrace(trace);
+  }, [exposures, mitigants]);
 
   // Fetch optimized from backend
-  useEffect(() => {
+  const runOptimization = useCallback(() => {
     setLoading(true);
-    fetchOptimization(EXPOSURES, MITIGANTS)
-      .then(({ heuristic, optimized }) => {
+    setError(null);
+    fetchOptimization(exposures, mitigants)
+      .then(({ optimized, heuristicTrace: trace, dualValues: duals, allocationMatrix: matrix }) => {
         setOptimizedResult(optimized);
-        // Use server heuristic if available (same algo, but validates parity)
-        if (!heuristicResult) setHeuristicResult(heuristic);
+        setDualValues(duals);
+        setAllocationMatrix(matrix);
+        if (trace.length > 0) setHeuristicTrace(trace);
       })
       .catch(err => setError(err.message))
       .finally(() => setLoading(false));
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [exposures, mitigants]);
 
-  // Recompute manual result when allocations change
-  const computeManual = useCallback(() => {
-    const result = computeAllocationResult(EXPOSURES, MITIGANTS, manualAllocs);
-    setManualResult(result);
-  }, [manualAllocs]);
-
+  // Run on mount and when portfolio changes
   useEffect(() => {
-    computeManual();
-  }, [computeManual]);
+    runHeuristic();
+    runOptimization();
+  }, [runHeuristic, runOptimization]);
+
+  // Recompute manual result
+  useEffect(() => {
+    setManualResult(computeAllocationResult(exposures, mitigants, manualAllocs));
+  }, [exposures, mitigants, manualAllocs]);
+
+  // Portfolio editor apply
+  function handleEditorApply(newExp: Exposure[], newMit: Mitigant[]) {
+    setExposures(newExp);
+    setMitigants(newMit);
+    setManualAllocs([]);
+    setEditorOpen(false);
+  }
 
   const activeResult = mode === 'manual' ? manualResult
     : mode === 'heuristic' ? heuristicResult
@@ -68,11 +102,11 @@ export default function App() {
 
   return (
     <div className="app-root">
-      <AppBar />
+      <AppBar onEditPortfolio={() => setEditorOpen(true)} />
       <main className="main-content">
         <KpiStrip
-          grossRwa={TOTAL_GROSS_RWA}
-          bestNetRwa={best?.r.totalNetRwa ?? TOTAL_GROSS_RWA}
+          grossRwa={totalGrossRwa}
+          bestNetRwa={best?.r.totalNetRwa ?? totalGrossRwa}
           bestSavingsPct={best?.r.rwaSavingsPct ?? 0}
           bestMode={best?.mode ?? 'manual'}
         />
@@ -92,41 +126,100 @@ export default function App() {
 
         {error && <div className="error-banner">Backend error: {error}. Showing client-side results only.</div>}
 
+        {/* Allocation Heatmap */}
+        <CollapsibleSection title="Allocation Patterns" defaultOpen={true}>
+          <AllocationHeatmap
+            exposures={exposures}
+            mitigants={mitigants}
+            manual={manualResult}
+            heuristic={heuristicResult}
+            optimized={optimizedResult}
+            allocationMatrix={allocationMatrix}
+          />
+        </CollapsibleSection>
+
+        {/* Decision Trace / Optimizer Insights */}
+        {mode === 'heuristic' && (
+          <CollapsibleSection title="Heuristic Decision Trace" defaultOpen={true}>
+            <HeuristicTrace trace={heuristicTrace} exposures={exposures} mitigants={mitigants} />
+          </CollapsibleSection>
+        )}
+        {mode === 'optimized' && (
+          <CollapsibleSection title="Optimizer Insights" defaultOpen={true}>
+            <OptimizerInsightPanel
+              heuristic={heuristicResult}
+              optimized={optimizedResult}
+              dualValues={dualValues}
+              exposures={exposures}
+              mitigants={mitigants}
+              heuristicMatrix={allocationMatrix['heuristic'] ?? {}}
+              optimizedMatrix={allocationMatrix['optimized'] ?? {}}
+            />
+          </CollapsibleSection>
+        )}
+
         <div className="two-col">
           <div className="col-left">
-            <PortfolioTable exposures={EXPOSURES} result={activeResult} />
+            <PortfolioTable exposures={exposures} result={activeResult} />
             {mode === 'manual' && (
               <ManualAllocator
-                exposures={EXPOSURES}
-                mitigants={MITIGANTS}
+                exposures={exposures}
+                mitigants={mitigants}
                 allocations={manualAllocs}
                 onChange={setManualAllocs}
               />
             )}
           </div>
           <div className="col-right">
-            <MitigantPanel mitigants={MITIGANTS} />
+            <MitigantPanel mitigants={mitigants} />
           </div>
         </div>
 
-        <h2 className="section-title">Strategy Comparison</h2>
-        <ComparisonTable
-          exposures={EXPOSURES}
-          manual={manualResult}
-          heuristic={heuristicResult}
-          optimized={optimizedResult}
-        />
+        <CollapsibleSection title="Strategy Comparison" defaultOpen={true}>
+          <ComparisonTable
+            exposures={exposures}
+            manual={manualResult}
+            heuristic={heuristicResult}
+            optimized={optimizedResult}
+          />
+        </CollapsibleSection>
 
         <div className="charts-row">
           <SummaryBarChart
-            grossRwa={TOTAL_GROSS_RWA}
+            grossRwa={totalGrossRwa}
             manual={manualResult}
             heuristic={heuristicResult}
             optimized={optimizedResult}
           />
           <WaterfallChart result={activeResult} mode={mode} />
         </div>
+
+        <CollapsibleSection title="Advanced Analysis" defaultOpen={false}>
+          <div className="analysis-row">
+            <div className="card chart-card">
+              <h3 className="card-title">Haircut Sensitivity</h3>
+              <SensitivityPanel
+                exposures={exposures}
+                mitigants={mitigants}
+                baseNetRwa={optimizedResult?.totalNetRwa ?? totalGrossRwa}
+              />
+            </div>
+            <div className="card chart-card">
+              <h3 className="card-title">Mitigation Concentration</h3>
+              <ConcentrationChart result={activeResult} />
+            </div>
+          </div>
+        </CollapsibleSection>
       </main>
+
+      {editorOpen && (
+        <PortfolioEditorDrawer
+          exposures={exposures}
+          mitigants={mitigants}
+          onApply={handleEditorApply}
+          onClose={() => setEditorOpen(false)}
+        />
+      )}
     </div>
   );
 }

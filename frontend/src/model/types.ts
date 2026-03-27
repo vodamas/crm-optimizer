@@ -54,3 +54,39 @@ export interface AllocationResult {
   rwaSavingsPct: number;
   byMitigantType: Record<string, number>;
 }
+
+export interface HeuristicStep {
+  stepNumber: number;
+  exposureId: string;
+  mitigantId: string;
+  reason: string;
+  rwaSaving: number;
+  fraction: number;
+}
+
+export interface DualValues {
+  mitigantMarginals: Record<string, number>;
+}
+
+export interface SensitivityPoint {
+  stressFactor: number;
+  totalNetRwa: number;
+}
+
+export type AllocationMatrix = Record<string, Record<string, number>>;
+// exposureId -> mitigantId -> fraction
+
+export interface OsfiReference {
+  chapter: string;
+  sections: string;
+  title: string;
+  summary: string;
+}
+
+export interface PortfolioPreset {
+  id: string;
+  name: string;
+  description: string;
+  exposures: Exposure[];
+  mitigants: Mitigant[];
+}
